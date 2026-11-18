@@ -22,6 +22,7 @@ Uso:
     python3 arte_do_dia.py --force         # envia mesmo que já tenha enviado hoje
     python3 arte_do_dia.py --url <URL>     # usa uma página /asset/... específica (teste)
     python3 arte_do_dia.py --debug-home    # salva o HTML da home e mostra a obra detectada
+    python3 arte_do_dia.py --find <ID>     # mostra em qual elemento da home a obra aparece
 
 Agendamento diário (cron, todo dia às 08:00):
     0 8 * * * /usr/bin/python3 /caminho/arte_do_dia.py >> /caminho/arte_do_dia.log 2>&1
@@ -195,6 +196,95 @@ def discover_asset_url() -> str:
     )
 
 
+JS_CONTEXT = r"""
+(needle) => {
+  const a = [...document.querySelectorAll('a[href]')].find(x => x.href.includes(needle));
+  if (!a) return null;
+  const chain = [];
+  let n = a;
+  for (let i = 0; n && i < 8; i++, n = n.parentElement) {
+    let d = n.tagName.toLowerCase();
+    if (n.id) d += '#' + n.id;
+    if (typeof n.className === 'string' && n.className.trim())
+      d += '.' + n.className.trim().split(/\s+/).slice(0, 3).join('.');
+    const al = n.getAttribute('aria-label');
+    if (al) d += '[aria-label="' + al + '"]';
+    chain.push(d);
+  }
+  const heads = [...document.querySelectorAll('h1,h2,h3,h4,[role=heading]')];
+  const before = heads.filter(
+    h => h.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING
+  ).pop();
+  const box = a.parentElement && a.parentElement.parentElement;
+  return {
+    href: a.href,
+    chain,
+    heading: before ? before.innerText.trim() : null,
+    text: box ? box.innerText.trim().slice(0, 300) : "",
+  };
+}
+"""
+
+
+def find_in_home(needle: str) -> int:
+    """Mostra ONDE (qual elemento) um ID/slug de obra aparece na home.
+
+    Útil para descobrir como o Google marca a 'Obra de arte do dia' e ajustar o script.
+    Ex.: python3 arte_do_dia.py --find twGyqq52R-lYpA
+    """
+    out = Path(__file__).with_name("preview")
+    out.mkdir(exist_ok=True)
+
+    static_html = get(HOME_URL).text
+    (out / "home_static.html").write_text(static_html, encoding="utf-8")
+    print(f"=== HTML estático ===")
+    print(f"Ocorrências no texto bruto : {static_html.count(needle)}")
+    soup = BeautifulSoup(static_html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    anchors = soup.find_all("a", href=lambda h: h and needle in h)
+    print(f"Links no DOM visível       : {len(anchors)}")
+    for a in anchors[:3]:
+        chain = []
+        for parent in a.parents:
+            if parent.name in (None, "[document]"):
+                continue
+            d = parent.name + (f"#{parent['id']}" if parent.get("id") else "")
+            if parent.get("class"):
+                d += "." + ".".join(parent["class"][:3])
+            chain.append(d)
+            if len(chain) >= 8:
+                break
+        head = a.find_previous(["h1", "h2", "h3", "h4"])
+        print("  cadeia :", " < ".join(chain))
+        print("  título :", head.get_text(" ", strip=True) if head else None)
+
+    print("\n=== Página renderizada (Playwright) ===")
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Playwright não instalado — pulei esta etapa.")
+        return 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(locale="pt-BR", user_agent=HEADERS["User-Agent"])
+        page.goto(HOME_URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(2500)
+        info = page.evaluate(JS_CONTEXT, needle)
+        (out / "home_rendered.html").write_text(page.content(), encoding="utf-8")
+        browser.close()
+    if not info:
+        print("Não encontrado: a obra não aparece na home renderizada.")
+        print("→ Ela pode estar em outra página (ex.: /discover) ou só no app/logado.")
+        return 0
+    print("href   :", info["href"])
+    print("cadeia :", " < ".join(info["chain"]))
+    print("título :", info["heading"])
+    print("texto  :", info["text"].replace("\n", " | "))
+    print(f"\nHTML salvo em {out}/")
+    return 0
+
+
 def debug_home() -> int:
     """Salva o HTML estático e o renderizado em ./preview/ e mostra o que foi achado."""
     out = Path(__file__).with_name("preview")
@@ -248,6 +338,17 @@ def fetch_artwork(asset_url: str) -> dict:
     asset_url = with_hl(asset_url)
     soup = BeautifulSoup(get(asset_url).text, "html.parser")
     details = parse_details(soup)
+
+    # As etiquetas não vêm na lista "Detalhes": são os links/chips no fim da página
+    # (hrefs com ?categoryId=artist|place|art-movement|medium...).
+    if not any(k in details for k in ("etiquetas", "tags")):
+        chips = [
+            (a.get("title") or a.get_text(strip=True)).strip()
+            for a in soup.find_all("a", href=re.compile(r"categoryId="))
+        ]
+        chips = [c for c in chips if c]
+        if chips:
+            details["etiquetas"] = ", ".join(dict.fromkeys(chips))
 
     # Fallbacks de título/criador via og:title ("Título - Criador - Google Arts & Culture")
     og_title = re.sub(r"\s*-\s*Google Arts (&|&amp;) Culture\s*$", "", meta(soup, "og:title"))
@@ -355,11 +456,15 @@ def main() -> int:
     ap.add_argument("--url", help="URL de uma página /asset/... (ignora a descoberta automática)")
     ap.add_argument("--debug-home", action="store_true",
                     help="salva o HTML da home em ./preview/ e mostra a obra detectada")
+    ap.add_argument("--find", metavar="ID_OU_SLUG",
+                    help="mostra em qual elemento da home aparece uma obra (ex.: twGyqq52R-lYpA)")
     args = ap.parse_args()
 
     load_dotenv(Path(__file__).with_name(".env"))
     if args.debug_home:
         return debug_home()
+    if args.find:
+        return find_in_home(args.find)
 
     state = {}
     if STATE_FILE.exists():

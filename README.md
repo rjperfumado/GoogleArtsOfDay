@@ -128,10 +128,15 @@ Campos que a ficha da obra **não possui** aparecem como `—`. Ao final, o e-ma
 
 ## Requisitos e instalação
 
-- Python **3.10+**
+- Python **3.10+** (com o módulo `venv`; no Ubuntu: `sudo apt install python3-venv`)
 - Acesso à internet e a um servidor SMTP
 
+Instale as dependências em um **ambiente virtual (venv)** dentro da pasta do script:
+
 ```bash
+cd /caminho/do/script
+python3 -m venv venv
+source venv/bin/activate
 pip install requests beautifulsoup4
 ```
 
@@ -141,6 +146,8 @@ pip install requests beautifulsoup4
 pip install playwright
 playwright install chromium
 ```
+
+> ⚠️ **Importante:** o cron **não ativa** o ambiente virtual. Para o agendamento funcionar, ele deve chamar diretamente o Python de dentro do venv (`/caminho/do/script/venv/bin/python`). Veja [Agendamento diário](#agendamento-diário).
 
 > Em servidores Linux sem interface gráfica, o Chromium do Playwright pode exigir bibliotecas do sistema. Se necessário: `playwright install-deps chromium`.
 
@@ -178,6 +185,7 @@ chmod 600 .env
 echo ".env" >> .gitignore
 echo ".arte_do_dia_state.json" >> .gitignore
 echo "preview/" >> .gitignore
+echo "venv/" >> .gitignore
 ```
 
 ---
@@ -195,6 +203,7 @@ python3 arte_do_dia.py [opções]
 | `--force` | Envia mesmo que já tenha enviado hoje. |
 | `--url <URL>` | Usa uma página `/asset/...` específica em vez da obra do dia (útil para testar a extração). |
 | `--debug-home` | Salva `home_static.html` e `home_rendered.html` em `./preview/` e mostra qual obra cada método detectou. |
+| `--find <ID_OU_SLUG>` | Mostra **em qual elemento da home** uma obra aparece (cadeia de elementos, título da seção e texto ao redor), no HTML estático e na página renderizada. Serve para descobrir como o site marca a obra do dia. Ex.: `--find twGyqq52R-lYpA`. |
 
 ### Exemplos
 
@@ -210,6 +219,9 @@ python3 arte_do_dia.py --dry-run --url "https://artsandculture.google.com/asset/
 
 # Diagnosticar a detecção da obra do dia
 python3 arte_do_dia.py --debug-home
+
+# Descobrir onde uma obra específica aparece na home
+python3 arte_do_dia.py --find twGyqq52R-lYpA
 ```
 
 **Código de saída:** `0` em caso de sucesso (ou se já enviou hoje) e `1` em caso de erro, com a mensagem em `stderr`.
@@ -220,10 +232,32 @@ python3 arte_do_dia.py --debug-home
 
 ### Cron (Linux/macOS)
 
+O cron executa com um ambiente mínimo e **não carrega o venv**. Por isso, use o **caminho absoluto do Python do ambiente virtual**, que é onde estão instaladas as bibliotecas (`requests`, `beautifulsoup4`, `playwright`):
+
 ```cron
 # Todo dia às 08:00
-0 8 * * * cd /caminho/do/script && /usr/bin/python3 arte_do_dia.py >> arte_do_dia.log 2>&1
+0 8 * * * cd /caminho/do/script && /caminho/do/script/venv/bin/python arte_do_dia.py >> /caminho/do/script/arte_do_dia.log 2>&1
 ```
+
+Edite com `crontab -e` e confira com `crontab -l`.
+
+Para descobrir o caminho exato do Python do venv:
+
+```bash
+source /caminho/do/script/venv/bin/activate
+which python
+```
+
+**Dicas para o cron:**
+
+- Use **caminhos absolutos** sempre (o cron não parte da pasta do script; o `cd ... &&` garante que o `.env`, o arquivo de estado e a pasta `preview/` fiquem ao lado do script).
+- **Teste exatamente o comando do cron** no terminal antes de agendar:
+  ```bash
+  cd /caminho/do/script && /caminho/do/script/venv/bin/python arte_do_dia.py --dry-run
+  ```
+- O Playwright guarda o Chromium em `~/.cache/ms-playwright` do usuário que rodou `playwright install chromium`. Agende o cron **com o mesmo usuário** (`crontab -e` sem `sudo`) para que o navegador seja encontrado.
+- Se o cron não tiver `HOME` definido no seu sistema, acrescente no topo do crontab: `HOME=/home/seu_usuario`.
+- Em caso de falha, consulte o `arte_do_dia.log`.
 
 ### systemd timer (alternativa)
 
@@ -235,7 +269,8 @@ Description=Envia a Obra de arte do dia por e-mail
 [Service]
 Type=oneshot
 WorkingDirectory=/caminho/do/script
-ExecStart=/usr/bin/python3 /caminho/do/script/arte_do_dia.py
+User=seu_usuario
+ExecStart=/caminho/do/script/venv/bin/python /caminho/do/script/arte_do_dia.py
 ```
 
 `/etc/systemd/system/arte-do-dia.timer`
@@ -282,6 +317,7 @@ sudo systemctl enable --now arte-do-dia.timer
 | Campos aparecendo como `—` | O rótulo na página é diferente do esperado ou a obra não tem o dado. | Confira a ficha no site e ajuste os apelidos na lista `FIELDS` do script. |
 | `SMTPAuthenticationError` | Senha incorreta ou conta sem senha de app. | Gere uma senha de app e use-a em `SMTP_PASS`. |
 | `Variável SMTP_USER não definida` | `.env` ausente ou em outra pasta. | O `.env` deve ficar ao lado do script (ou exporte as variáveis). |
+| Funciona no terminal, mas **falha no cron** (`ModuleNotFoundError: No module named 'requests'` etc.) | O cron está usando o Python do sistema, sem as bibliotecas. | Aponte o cron para `venv/bin/python` (caminho absoluto), como no exemplo acima. |
 | Nada acontece ("Já enviado hoje") | A trava diária foi acionada. | Use `--force` ou apague `.arte_do_dia_state.json`. |
 | E-mail cai no spam | Remetente/servidor sem reputação. | Use um SMTP confiável e marque a mensagem como "não é spam" na primeira vez. |
 
